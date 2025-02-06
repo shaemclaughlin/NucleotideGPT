@@ -37,3 +37,12 @@ input_data/
 bin/
 cpp/
 update/
+projects/bio/experiments.ipynb
+# Additional files to ignore
+.ls
+COPYING
+README.txt
+config.txt
+configureHomer.pl*
+process_all.sh
+update.txt
