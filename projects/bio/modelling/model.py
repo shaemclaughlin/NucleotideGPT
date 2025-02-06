@@ -81,35 +81,37 @@ def _logical_to_sharding(logical: P, mesh: jax.sharding.Mesh, rules: ShardingRul
 
 @struct.dataclass
 class Config:
-    d_model: int
-    ffw_multiplier: int
-    query_heads: int
-    key_heads: int
-    num_layers: int
-    key_dim: int
-    vocab_size: int
+    d_model: int # Model dimension/width
+    ffw_multiplier: int # How much to scale up in feedforward layers
+    query_heads: int # Number of attention heads for queries
+    key_heads: int # Number of attention heads for keys
+    num_layers: int # Number of transformer layers
+    key_dim: int # Dimension of keys/queries
+    vocab_size: int # Size of vocabulary
     # Max seq len here can be a source of nasty bugs in incremental prefill
     # if we overflow (since dynamic slice will shunt left instead of erroring. Fix?
-    max_seq_len: int
-    causal: bool
-    use_attn_kernel: bool
-    weight_dtype_at_rest: jnp.float32
-    active_weight_dtype: jnp.bfloat16
+    max_seq_len: int # Maximum sequence length
+    causal: bool # Whether to use causal (unidirectional) attention
+    use_attn_kernel: bool # Whether to use optimized "flash attention" on TPU
+    weight_dtype_at_rest: jnp.float32 # Data type for storing weights
+    active_weight_dtype: jnp.bfloat16 # Data type during computation
     # Sharding rules
-    rules: ShardingRules
-    mesh: jax.sharding.Mesh | None
+    rules: ShardingRules # How to distribute model across TPU cores
+    mesh: jax.sharding.Mesh | None # TPU device mesh configuration
     # Optimizer config
-    max_lr: float = 3e-4
-    min_lr: float = 1e-5
-    warmup_steps: int = 50
-    total_steps: int = 10000
+    max_lr: float = 3e-4 # Maximum learning rate
+    min_lr: float = 1e-5 # Minimum learning rate
+    warmup_steps: int = 50 # Steps for learning rate warmup
+    total_steps: int = 10000 # Total training steps
     # Rescale gradients which spike.
-    grad_norm_clip: float = 0.1
+    grad_norm_clip: float = 0.1 # Gradient clipping threshold
     # MEGABYTE only https://openreview.net/pdf?id=JTmO2V9Xpz
     mega_byte: bool = False
     patch_size: int | None = 1
     # BERT
     mask_token: int | None = None
+    # SAE
+    return_sae_intermediates: bool = False # Flag to return intermediate activations
 
     @property
     def patch_d(self):
@@ -125,6 +127,34 @@ class TensorInfo:
 
 
 def process_batch(batch, cfg, step_idx: int | None = None):
+    """Process a batch of genomic sequences for training.
+    
+    This function prepares input-target pairs for next-token prediction training.
+    It shifts sequences by patch_size to create input-target pairs and handles padding appropriately.
+    For standard training (mega_byte=False), it shifts sequences by 1 token.
+    For megabyte training, it shifts by larger patch_size to process chunks.
+    
+    Args:
+        batch: Dictionary containing:
+        - x: array of shape [batch_size, sequence_length] containing token IDs
+        - segment_ids: array of shape [batch_size, sequence_length] indicating which tokens belong to the same sequence (0 for padding)
+        cfg: Config object containing model parameters including patch_size
+        step_idx: Optional training step index (unused)
+        
+    Returns:
+        Dictionary containing:
+        - x: Input sequences with last patch_size token removed, padded with zeros
+        - y: Target sequences starting from patch_size, padded with zeros
+        - segment_ids: Segment IDs aligned with x, padded with zeros
+        - aux: Additional data (none in this case)
+        
+    Example:
+        For sequence "ATCGATCG" with patch_size=2:
+        Input (x): "ATCGAT00" (00 is padding)
+        Target (y): "CGATCG00" (00 is padding)
+
+        The model learns to predict 'y' given 'x', effectively learning to predict the next tokens in the sequence.
+        """
     del step_idx
     batch_size = batch["x"].shape[0]
     # Patch size lets us handle megabyte style methods to reduce effective seqlen.
@@ -133,7 +163,7 @@ def process_batch(batch, cfg, step_idx: int | None = None):
     return {
         "x": np.concatenate([batch["x"][:, : -cfg.patch_size], dummy], axis=-1),
         "y": np.concatenate([batch["x"][:, cfg.patch_size :], dummy], axis=-1),
-        # TODO(sholto): Maybe we should padd in dataset so we are't attending to next seq.
+        # TODO(sholto): Maybe we should pad in dataset so we are't attending to next seq.
         "segment_ids": np.concatenate([batch["segment_ids"][:, : -cfg.patch_size], dummy], axis=-1),
         "aux": None,
     }
@@ -176,24 +206,31 @@ def process_batch_shae(batch, cfg, step_idx: int | None = None):
 
 @struct.dataclass
 class Layer:
-    q: jax.Array | TensorInfo
-    k: jax.Array | TensorInfo
-    v: jax.Array | TensorInfo
-    proj: jax.Array | TensorInfo
-    w1: jax.Array | TensorInfo
-    w2: jax.Array | TensorInfo
-    # Extra layernorms like grok.
-    attn_in_gamma: jax.Array | TensorInfo
-    attn_out_gamma: jax.Array | TensorInfo
-    ff_in_gamma: jax.Array | TensorInfo
-    ff_out_gamma: jax.Array | TensorInfo
+    # Each transformer layer has these components
+    q: jax.Array | TensorInfo # Query matrix for attention
+    k: jax.Array | TensorInfo # Key matrix for attention
+    v: jax.Array | TensorInfo # Value matrix for attention
+    proj: jax.Array | TensorInfo # Projection after attention
+    w1: jax.Array | TensorInfo # First feedforward layer weight
+    w2: jax.Array | TensorInfo # Second feedforward layer weight
+    
+    # Layer normalization parameters
+    attn_in_gamma: jax.Array | TensorInfo # Pre-attention normalization
+    attn_out_gamma: jax.Array | TensorInfo # Post-attention normalization
+    ff_in_gamma: jax.Array | TensorInfo # Pre-feedforward normalization
+    ff_out_gamma: jax.Array | TensorInfo # Post-feedforward normalization
 
     @classmethod
     def abstract(cls, cfg: Config):
+        # This defines the shape and initialization of each component
+        # For example, the query matrix 'q'
         return Layer(
             q=TensorInfo(
+                # Shape: (model_dimension, number_of_query_heads, key_dimension)
                 jax.ShapeDtypeStruct((cfg.d_model, cfg.query_heads, cfg.key_dim), cfg.weight_dtype_at_rest),
+                # How it should be sharded across TPUs
                 ("d_model", "query_heads", "key_dim"),
+                # Initialize using He normal intialization
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=(1, 2)),
             ),
             k=TensorInfo(
@@ -246,10 +283,10 @@ class Layer:
 
 @struct.dataclass
 class Weights:
-    layers: list[Layer]
-    embedding: jax.Array | TensorInfo
-    vocab_proj: jax.Array | TensorInfo
-    gamma_final: jax.Array | TensorInfo
+    layers: list[Layer] # List of transformer layers
+    embedding: jax.Array | TensorInfo # Token embedding matrix
+    vocab_proj: jax.Array | TensorInfo # Final projection to vocabulary
+    gamma_final: jax.Array | TensorInfo # Final layer normalization
     # MEGABYTE only.
     causal_convs: list[jax.Array | TensorInfo] | None
     mini_model: list[Layer]
@@ -417,12 +454,37 @@ class KVCache:
 
 
 def segment_ids_to_positions(segment_ids):
-    """Counts positions for segment ids."""
+    """Converts segment IDs to position numbers within each segment.
+    
+    Example:
+    Tokens = [[A,T,C,G,A,T,C,G], # Sequence 1
+             [G,C,T,A,0,0,0,0]] # Sequence 2 (padded with zeros)
+    
+    segment_ids = [[1,1,1,1,1,1,1,1], # All 1s because it's one complete sequence
+                   [1,1,1,1,0,0,0,0]] # 1s for real sequence, 0s for padding
+    
+    # After segment_ids_to_positions
+    positions = [[0,1,2,3,4,5,6,7], # Counts up for the whole sequence
+                 [0,1,2,3,0,0,0,0]] # Counts up for real tokens, 0 for padding
+    ]
+    
+    This is important because position embeddings need to know where real tokens start and end.
+
+    Counts up from 0 within each same segment ID, restarts at 0 for new segment IDs, and keeps 0 for padding (segment_id=0)
+
+    """
 
     def scan_fun(a, b):
+        # a[0] is current position count
+        # a[1] is previous segment ID
+        # b is current segment id
         return ((a[0] + 1) * (a[1] == b[1]) + b[0], b[1])
 
+    # Initialize with zeros and the segment IDs
     vals = (jnp.zeros_like(segment_ids), segment_ids)
+
+    # Use JAX's associative scan to efficiently compute positions
+    # The [0 at the end takes just the position counts, not the segment IDs]
     return jnp.array(jax.lax.associative_scan(scan_fun, vals, axis=-1)[0], dtype="int32")
 
 
@@ -634,7 +696,7 @@ def forward_layer(
                 # Axis -1 because we are in vmap.
                 return jax.lax.dynamic_update_slice_in_dim(original, update, at, axis=cache.time_axis - 1)
 
-            # TODO(sholto): Guaranteed this introduces a gather :)
+            
             k, v = jax.vmap(update, in_axes=(0, 0, 0))(cache_k, k.astype(cache_k.dtype), cache.lengths), jax.vmap(
                 update, in_axes=(0, 0, 0)
             )(cache_v, v.astype(cache_v.dtype), cache.lengths)
@@ -684,6 +746,9 @@ def forward_layer(
         ff_out = rms_norm(ff_out, layer.ff_out_gamma)
         x = x + ff_out
 
+
+    if cfg.return_sae_intermediates and idx == cfg.num_layers // 2:
+        internals[f'layer_{idx}_activations'] = x
     return x, k, v
 
 

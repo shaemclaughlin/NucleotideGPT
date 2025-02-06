@@ -1,14 +1,9 @@
-"""Downloads data for charformer.
+"""Downloads data for Nucleotide GPT Pre-training
 
+Example command:
 
-python3 projects/bio/download_data.py
+python 3 projects/bio/download_data.py --dataset human_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
 
-python3 projects/bio/download_data.py --dataset open-genome-imgpr --use-gcs --bucket-name minformer_data --sequence-length=16384
-python3 projects/bio/download_data.py --dataset drosophila_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
-python3 projects/bio/download_data.py --dataset macaque_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
-python3 projects/bio/download_data.py --dataset mouse_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
-python3 projects/bio/download_data.py --dataset zebrafish_genome_8192bp_bins_no_N --use-gcs --bucket-name minformer_data --sequence-length=8192
-python3 projects/bio/download_data.py --dataset lab_data --use-gcs --bucket-name minformer_data --sequence-length=8192
 """
 
 import argparse
@@ -20,22 +15,60 @@ import data
 import data_hf
 import data_shae
 import pandas as pd
-from datasets import load_dataset
 from google.cloud import storage
 
-EUKARYOTE = ['drosophila_genome_8192bp_bins_no_N', 'macaque_genome_8192bp_bins_no_N', 'mouse_genome_8192bp_bins_no_N', 'zebrafish_genome_8192bp_bins_no_N']
-
+EUKARYOTE = [
+    'Bradyrhizobium_japonicum_8192bp_bins_no_N',
+    'Burkholderia_pseudomallei_8192bp_bins_no_N',
+    'Caenorhabditis_elegans_8192bp_bins_no_N',
+    'Combined_viruses_8192bp_bins_no_N',
+    'Mixed_viruses_set2_8192bp_bins_no_N',
+    'Ornithorhynchus_anatinus_8192bp_bins_no_N',
+    'Monodelphis_domestica_8192bp_bins_no_N',
+    'Pseudomonas_fluorescens_8192bp_bins_no_N',
+    'Rhodococcus_jostii_8192bp_bins_no_N',
+    'bacteroides_genome_8192bp_bins_no_N',
+    'borrelia_genome_8192bp_bins_no_N',
+    'candida_genome_8192bp_bins_no_N',
+    'chlamydia_genome_8192bp_bins_no_N',
+    'drosophila_genome_8192bp_bins_no_N',
+    'ecoli_genome_8192bp_bins_no_N', 
+    'haloferax_genome_8192bp_bins_no_N',
+    'human_genome_8192bp_bins_no_N',
+    'macaque_genome_8192bp_bins_no_N',
+    'methanogen_genome_8192bp_bins_no_N',
+    'mouse_genome_8192bp_bins_no_N',
+    'myxococcus_genome_8192bp_bins_no_N',
+    'pombe_genome_8192bp_bins_no_N',
+    'pseudomonas_genome_8192bp_bins_no_N',
+    'pylori_genome_8192bp_bins_no_N',
+    'saccharomyces_cerevisiae_8192bp_bins_no_N',
+    'streptomyces_genome_8192bp_bins_no_N',
+    'subtilis_genome_8192bp_bins_no_N',
+    'sulfolobus_genome_8192bp_bins_no_N',
+    'tb_genome_8192bp_bins_no_N',
+    'thermus_genome_8192bp_bins_no_N',
+    'zebrafish_genome_8192bp_bins_no_N'
+]
 def parse_args():
+    # Creates a new argument parser
     parser = argparse.ArgumentParser(description="Download and process DNA data")
+
+    # Add argument for dataset selection
     parser.add_argument(
-        "--dataset",
-        type=str,
-        choices=["human-genome-8192", "open-genome-imgpr", "lab_data"] + EUKARYOTE,
-        default="open-genome-imgpr",
-        help="Type of dataset to download and process",
+        "--dataset", # The flag used in command line
+        type=str, # Type of input expected
+        choices=["human-genome-8192", "open-genome-imgpr", "lab_data"] + EUKARYOTE, # Valid options
+        default="open-genome-imgpr", # What to use if no dataset specified
+        help="Type of dataset to download and process", # Help message
     )
+
+    # Add argument for using Google Cloud Storage
     parser.add_argument("--use-gcs", action="store_true", help="Use Google Cloud Storage")
+    
+    # Add argument for bucket name
     parser.add_argument("--bucket-name", type=str, help="GCS bucket name")
+    
     parser.add_argument("--sequence-length", type=int, default=8192, help="Training seqlen")
     return parser.parse_args()
 
@@ -123,7 +156,7 @@ def main():
         file_name = f"eukaryote_pands/{args.dataset}.csv"
         print("Loading csv - takes two minutes.")
         df = load_csv_from_gcp_bucket(bucket_name, file_name)
-        output_dir = f"gs://{args.bucket_name}/{args.dataset}/tfrecords/"
+        output_dir = f"gs://{args.bucket_name}/diverse_genomes_tf/{args.dataset}/tfrecords/"
         data_shae.process_rows(df, output_dir=output_dir, bucket=args.sequence_length)
     elif args.dataset == 'lab_data':
         bucket_name = "minformer_data"

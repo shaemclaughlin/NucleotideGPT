@@ -1,5 +1,6 @@
 projects/charformer/data/
 projects/bio/data/
+projects/bio/wandb
 
 # Ignore all __pycache__ directories
 __pycache__/
@@ -9,3 +10,30 @@ __pycache__/
 
 .venv
 .vscode
+*.py[cod]
+*$py.class
+.env
+.venv/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb_meta
+Untitled*.ipynb
+
+# Generated files
+*.bedgraph
+*.bedGraph
+*.pdf
+*.png
+*.log
+processing_report_*
+feature_*
+*.csv
+
+# Directories
+input_data/
+bin/
+cpp/
+update/
