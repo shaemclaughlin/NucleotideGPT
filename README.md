@@ -122,3 +122,23 @@ To continue training from a previous run:
 ```
 python train.py --resume_from_checkpoint --checkpoint_dir gs://YOUR_BUCKET/checkpoints/nucleotide_0.5
 ```
+
+**Finetuning**
+After pretraining, finetune on genomic classification tasks from the Genomic Benchmarks dataset.
+Example usage:
+```
+python finetune.py \
+  --dataset_name human_ensembl_regulatory \
+  --pretrained_checkpoint_dir gs://YOUR_BUCKET/checkpoints/nucleotide_0.5 \
+  --finetuned_checkpoint_dir gs://YOUR_BUCKET/finetuned/human_ensembl_regulatory \
+  --num_classes 3 \
+  --num_epochs 1 \
+  --batch_size 16 \
+  --max_lr 2e-5
+```
+This script will:
+- Load data from Google Cloud Storage
+- Initialize a classification head on top of the pretrained model
+- Train for the specified number of epochs
+- Evaluate on the test set with MCC, F1, and accuracy metrics
+- Save the finetuned checkpoint
