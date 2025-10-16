@@ -123,7 +123,7 @@ To continue training from a previous run:
 python train.py --resume_from_checkpoint --checkpoint_dir gs://YOUR_BUCKET/checkpoints/nucleotide_0.5
 ```
 
-**Finetuning**
+### Finetuning
 After pretraining, finetune on genomic classification tasks from the Genomic Benchmarks dataset.
 Example usage:
 ```
@@ -142,3 +142,16 @@ This script will:
 - Train for the specified number of epochs
 - Evaluate on the test set with MCC, F1, and accuracy metrics
 - Save the finetuned checkpoint
+
+### Model Comparisons
+To compare Nucleotide GPT with other published genomic language models, we provide a Google Colab notebook for benchmarking baseline models on the same Genomic Benchmarks tasks.
+Running comparisons:
+1. Open benchmarking.ipynb in Google Colab
+2. Set runtime to GPU
+3. Update the BUCKET_NAME variable with your GCS bucket
+4. Run all cells
+This notebook benchmarks:
+- DNABERT (6-mer tokenization)
+- HyenaDNA (character-level, long-context)
+- Nucleotide Transformer (500M parameter model)
+These models require PyTorch and GPU, unlike Nucleotide GPT which uses JAX/TPU.
