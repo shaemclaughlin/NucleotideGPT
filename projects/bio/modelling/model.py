@@ -509,6 +509,7 @@ def compute_loss(weights, x, segment_ids, y, cfg, aux=None):
     if aux is not None and "lowercase_mask" in aux:
         lowercase_mask = aux["lowercase_mask"]
         # Weight: 0.0 for lowercase (repetitive elements), 1.0 for uppercase
+        # Note: For paper experiments, this was manually changed to 0.0, 0.1, 0.5, or 1.0 to test different RE downweighting strategies
         token_weights = jnp.where(lowercase_mask == 1, 0.0, 1.0)
         loss_mask = loss_mask * token_weights
     
