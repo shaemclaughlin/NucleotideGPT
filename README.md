@@ -145,13 +145,19 @@ This script will:
 
 ### Model Comparisons
 To compare Nucleotide GPT with other published genomic language models, we provide a Google Colab notebook for benchmarking baseline models on the same Genomic Benchmarks tasks.
+
 Running comparisons:
 1. Open benchmarking.ipynb in Google Colab
 2. Set runtime to GPU
 3. Update the BUCKET_NAME variable with your GCS bucket
 4. Run all cells
+   
 This notebook benchmarks:
 - DNABERT (6-mer tokenization)
 - HyenaDNA (character-level, long-context)
 - Nucleotide Transformer (500M parameter model)
+  
 These models require PyTorch and GPU, unlike Nucleotide GPT which uses JAX/TPU.
+
+**Contact Details:**
+If you have any questions or issues with this code, please contact me at shae.m.mclaughlin@gmail.com.
