@@ -1,4 +1,4 @@
-"""Minimal model definition."""
+"""Minimal model definition by Sholto Douglas."""
 
 import dataclasses
 import math
