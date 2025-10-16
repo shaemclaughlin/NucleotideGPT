@@ -29,7 +29,7 @@ Nucleotide GPT employs a LLaMA-style decoder-only transformer with the following
 ### Installation
 **1. Clone the repository**
 ```
-git clone https://git clone https://github.com/shaemclaughlin/NucleotideGPT.git
+git clone https://github.com/shaemclaughlin/NucleotideGPT.git
 cd NucleotideGPT
 ```
 
