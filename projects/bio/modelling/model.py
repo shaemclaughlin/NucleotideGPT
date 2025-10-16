@@ -1,4 +1,13 @@
-"""Forked model because we'll want to mess with it seriously for biology.."""
+"""NucleotideGPT Model Definition
+
+A decoder-only transformer for genomic sequences with:
+- LLaMA-style architecture (RMSNorm, RoPE)
+- Repetitive element weighting for loss computation
+- SAE intermediate activation support
+- Single-nucleotide tokenization
+
+Adapted from Minformer by Sholto Douglas.
+"""
 
 import dataclasses
 import math
@@ -19,27 +28,16 @@ from jax.sharding import PartitionSpec as P
 
 
 def create_mesh():
-    """Always 1D because only care about FSDP."""
+    """Create 1D mesh for FSDP (Fully Sharded Data Parallelism)."""
     devices = jax.devices()
     mesh_shape = (len(devices),)
-    # Create a 1D mesh with all devices along the 'x' axis
     mesh = jax.sharding.Mesh(mesh_utils.create_device_mesh(mesh_shape, devices), ("x",))
     return mesh
 
 
 ShardingRules = namedtuple(
-    "FSDPRules",
-    [
-        "batch",
-        "sequence",
-        "d_model",
-        "query_heads",
-        "key_heads",
-        "key_dim",
-        "ffw",
-        "vocab",
-        "conv_window",
-    ],
+    "ShardingRules",
+    ["batch", "sequence", "d_model", "query_heads", "key_heads", "key_dim", "ffw", "vocab"],
 )
 
 # Define sharding rules for Fully Sharded Data Parallelism (FSDP)
@@ -52,10 +50,9 @@ fsdp_rules = ShardingRules(
     key_dim=None,
     ffw=None,
     vocab=None,
-    conv_window=None,
 )
 
-# Define sharding rules for model parallelism
+# Define sharding rules for model parallelism (kept for compatibility)
 mdl_parallel_rules = ShardingRules(
     batch=None,
     sequence=None,
@@ -65,7 +62,6 @@ mdl_parallel_rules = ShardingRules(
     key_dim=None,
     ffw="x",  # Shard feed-forward layer
     vocab=None,
-    conv_window=None,
 )
 
 
@@ -81,41 +77,37 @@ def _logical_to_sharding(logical: P, mesh: jax.sharding.Mesh, rules: ShardingRul
 
 @struct.dataclass
 class Config:
-    d_model: int # Model dimension/width
-    ffw_multiplier: int # How much to scale up in feedforward layers
-    query_heads: int # Number of attention heads for queries
-    key_heads: int # Number of attention heads for keys
-    num_layers: int # Number of transformer layers
-    key_dim: int # Dimension of keys/queries
-    vocab_size: int # Size of vocabulary
-    # Max seq len here can be a source of nasty bugs in incremental prefill
-    # if we overflow (since dynamic slice will shunt left instead of erroring. Fix?
-    max_seq_len: int # Maximum sequence length
-    causal: bool # Whether to use causal (unidirectional) attention
-    use_attn_kernel: bool # Whether to use optimized "flash attention" on TPU
-    weight_dtype_at_rest: jnp.float32 # Data type for storing weights
-    active_weight_dtype: jnp.bfloat16 # Data type during computation
-    # Sharding rules
-    rules: ShardingRules # How to distribute model across TPU cores
-    mesh: jax.sharding.Mesh | None # TPU device mesh configuration
-    # Optimizer config
-    max_lr: float = 3e-4 # Maximum learning rate
-    min_lr: float = 1e-5 # Minimum learning rate
-    warmup_steps: int = 50 # Steps for learning rate warmup
-    total_steps: int = 10000 # Total training steps
-    # Rescale gradients which spike.
-    grad_norm_clip: float = 0.1 # Gradient clipping threshold
-    # MEGABYTE only https://openreview.net/pdf?id=JTmO2V9Xpz
-    mega_byte: bool = False
-    patch_size: int | None = 1
-    # BERT
-    mask_token: int | None = None
-    # SAE
-    return_sae_intermediates: bool = False # Flag to return intermediate activations
-
-    @property
-    def patch_d(self):
-        return self.d_model // self.patch_size
+    # Model architecture
+    d_model: int  # Model dimension/width
+    ffw_multiplier: int  # Feedforward layer scaling factor
+    query_heads: int  # Number of attention heads for queries
+    key_heads: int  # Number of attention heads for keys
+    num_layers: int  # Number of transformer layers
+    key_dim: int  # Dimension of keys/queries
+    vocab_size: int  # Size of vocabulary
+    max_seq_len: int  # Maximum sequence length
+    
+    # Training configuration
+    causal: bool = True  # Use causal (unidirectional) attention
+    use_attn_kernel: bool = True  # Use optimized flash attention on TPU
+    weight_dtype_at_rest: jnp.dtype = jnp.float32  # Storage dtype
+    active_weight_dtype: jnp.dtype = jnp.bfloat16  # Computation dtype
+    
+    # Sharding configuration
+    rules: ShardingRules = None  # Sharding rules for distributed training
+    mesh: jax.sharding.Mesh = None  # TPU device mesh
+    
+    # Optimizer configuration
+    max_lr: float = 3e-4  # Maximum learning rate
+    min_lr: float = 1e-5  # Minimum learning rate
+    warmup_steps: int = 50  # Learning rate warmup steps
+    total_steps: int = 10000  # Total training steps
+    grad_norm_clip: float = 0.1  # Gradient clipping threshold
+    
+    # SAE support
+    return_sae_intermediates: bool = False  # Return intermediate activations for SAE
+    # Note: Layer 6 intermediate activations are extracted for SAE training (hardcoded in forward_layer)
+    # This avoids JAX tracing issues with integer config values
 
 
 @struct.dataclass
@@ -129,108 +121,46 @@ class TensorInfo:
 def process_batch(batch, cfg, step_idx: int | None = None):
     """Process a batch of genomic sequences for training.
     
-    This function prepares input-target pairs for next-token prediction training.
-    It shifts sequences by patch_size to create input-target pairs and handles padding appropriately.
-    For standard training (mega_byte=False), it shifts sequences by 1 token.
-    For megabyte training, it shifts by larger patch_size to process chunks.
-    
-    Args:
-        batch: Dictionary containing:
-        - x: array of shape [batch_size, sequence_length] containing token IDs
-        - segment_ids: array of shape [batch_size, sequence_length] indicating which tokens belong to the same sequence (0 for padding)
-        cfg: Config object containing model parameters including patch_size
-        step_idx: Optional training step index (unused)
-        
-    Returns:
-        Dictionary containing:
-        - x: Input sequences with last patch_size token removed, padded with zeros
-        - y: Target sequences starting from patch_size, padded with zeros
-        - segment_ids: Segment IDs aligned with x, padded with zeros
-        - aux: Additional data (none in this case)
-        
-    Example:
-        For sequence "ATCGATCG" with patch_size=2:
-        Input (x): "ATCGAT00" (00 is padding)
-        Target (y): "CGATCG00" (00 is padding)
-
-        The model learns to predict 'y' given 'x', effectively learning to predict the next tokens in the sequence.
-        """
+    Creates input-target pairs for next-token prediction by shifting sequences by 1.
+    """
     del step_idx
     batch_size = batch["x"].shape[0]
-    # Patch size lets us handle megabyte style methods to reduce effective seqlen.
-    # E.g. mega|byte|tran|sfor predict |byte|tran|sfor|----
-    dummy = np.zeros((batch_size, cfg.patch_size), dtype=jnp.int32)
+    dummy = np.zeros((batch_size, 1), dtype=jnp.int32)
+    
     return {
-        "x": np.concatenate([batch["x"][:, : -cfg.patch_size], dummy], axis=-1),
-        "y": np.concatenate([batch["x"][:, cfg.patch_size :], dummy], axis=-1),
-        # TODO(sholto): Maybe we should pad in dataset so we are't attending to next seq.
-        "segment_ids": np.concatenate([batch["segment_ids"][:, : -cfg.patch_size], dummy], axis=-1),
-        "aux": None,
-    }
-
-
-def process_batch_shae(batch, cfg, step_idx: int | None = None):
-    batch_size = batch["x"].shape[0]
-    aux = {
-        "lad_category": batch["lad_category"],
-        "lad_value": batch["lad_value"],
-        "sad_category": batch["sad_category"],
-        "sad_value": batch["sad_value"],
-    }
-
-    if cfg.causal:
-        # Patch size lets us handle megabyte style methods to reduce effective seqlen.
-        # E.g. mega|byte|tran|sfor predict |byte|tran|sfor|----
-        dummy = np.zeros((batch_size, cfg.patch_size), dtype=jnp.int32)
-        x = np.concatenate([batch["x"][:, : -cfg.patch_size], dummy], axis=-1)
-        y = np.concatenate([batch["x"][:, cfg.patch_size :], dummy], axis=-1)
-        segment_ids = np.concatenate([batch["segment_ids"][:, : -cfg.patch_size], dummy], axis=-1)
-    else:
-        segment_ids = batch["segment_ids"]
-        # In this case we are doing BERT.
-        bert_corruption = jax.random.randint(jax.random.key(step_idx), segment_ids.shape, 0, 100)
-        # 15 of tokens masked
-        masking = bert_corruption <= 15
-        masked_batch = jnp.where(masking, cfg.mask_token, batch["x"])
-        x = masked_batch
-        y = batch["x"]
-        aux["bert_mask"] = masking
-
-    return {
-        "x": x,
-        "y": y,
-        "segment_ids": segment_ids,
-        "aux": aux,
+        "x": np.concatenate([batch["x"][:, :-1], dummy], axis=-1),
+        "y": np.concatenate([batch["x"][:, 1:], dummy], axis=-1),
+        "segment_ids": np.concatenate([batch["segment_ids"][:, :-1], dummy], axis=-1),
+        "aux": batch.get("aux", None),  # Pass through auxiliary data like lowercase masks
     }
 
 
 @struct.dataclass
 class Layer:
-    # Each transformer layer has these components
-    q: jax.Array | TensorInfo # Query matrix for attention
-    k: jax.Array | TensorInfo # Key matrix for attention
-    v: jax.Array | TensorInfo # Value matrix for attention
-    proj: jax.Array | TensorInfo # Projection after attention
-    w1: jax.Array | TensorInfo # First feedforward layer weight
-    w2: jax.Array | TensorInfo # Second feedforward layer weight
+    # Attention weights
+    q: jax.Array | TensorInfo  # Query projection
+    k: jax.Array | TensorInfo  # Key projection
+    v: jax.Array | TensorInfo  # Value projection
+    proj: jax.Array | TensorInfo  # Output projection
     
-    # Layer normalization parameters
-    attn_in_gamma: jax.Array | TensorInfo # Pre-attention normalization
-    attn_out_gamma: jax.Array | TensorInfo # Post-attention normalization
-    ff_in_gamma: jax.Array | TensorInfo # Pre-feedforward normalization
-    ff_out_gamma: jax.Array | TensorInfo # Post-feedforward normalization
+    # Feedforward weights
+    w1: jax.Array | TensorInfo  # First FFN layer
+    w2: jax.Array | TensorInfo  # Second FFN layer
+    
+    # Layer normalization (RMSNorm) parameters
+    attn_in_gamma: jax.Array | TensorInfo  # Pre-attention norm
+    attn_out_gamma: jax.Array | TensorInfo  # Post-attention norm
+    ff_in_gamma: jax.Array | TensorInfo  # Pre-FFN norm
+    ff_out_gamma: jax.Array | TensorInfo  # Post-FFN norm
 
     @classmethod
     def abstract(cls, cfg: Config):
-        # This defines the shape and initialization of each component
-        # For example, the query matrix 'q'
+        """Define layer structure and initialization."""
         return Layer(
+            # Attention projections
             q=TensorInfo(
-                # Shape: (model_dimension, number_of_query_heads, key_dimension)
                 jax.ShapeDtypeStruct((cfg.d_model, cfg.query_heads, cfg.key_dim), cfg.weight_dtype_at_rest),
-                # How it should be sharded across TPUs
                 ("d_model", "query_heads", "key_dim"),
-                # Initialize using He normal intialization
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=(1, 2)),
             ),
             k=TensorInfo(
@@ -248,6 +178,7 @@ class Layer:
                 ("query_heads", "key_dim", "d_model"),
                 jax.nn.initializers.he_normal(in_axis=(0, 1), out_axis=2),
             ),
+            # Feedforward weights
             w1=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.d_model, cfg.d_model * cfg.ffw_multiplier), cfg.weight_dtype_at_rest),
                 ("d_model", "ffw"),
@@ -258,6 +189,7 @@ class Layer:
                 ("ffw", "d_model"),
                 jax.nn.initializers.he_normal(in_axis=1, out_axis=0),
             ),
+            # RMSNorm parameters
             attn_in_gamma=TensorInfo(
                 jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
                 ("d_model",),
@@ -283,90 +215,30 @@ class Layer:
 
 @struct.dataclass
 class Weights:
-    layers: list[Layer] # List of transformer layers
-    embedding: jax.Array | TensorInfo # Token embedding matrix
-    vocab_proj: jax.Array | TensorInfo # Final projection to vocabulary
-    gamma_final: jax.Array | TensorInfo # Final layer normalization
-    # MEGABYTE only.
-    causal_convs: list[jax.Array | TensorInfo] | None
-    mini_model: list[Layer]
-    # For predicting LADs
-    lad_hidden: jax.Array
-    lad_predictor: jax.Array
-    lad_regressor: jax.Array
-    sad_hidden: jax.Array
-    sad_predictor: jax.Array
-    sad_regressor: jax.Array
+    layers: list[Layer]  # Transformer layers
+    embedding: jax.Array | TensorInfo  # Token embeddings
+    vocab_proj: jax.Array | TensorInfo  # Output projection to vocabulary
+    gamma_final: jax.Array | TensorInfo  # Final layer norm
 
     @classmethod
     def abstract(cls, cfg: Config):
-        if cfg.mega_byte:
-            embed_dim = cfg.patch_d
-            windows = [3, 5, 7]
-            causal_convs = [
-                TensorInfo(
-                    jax.ShapeDtypeStruct((window, cfg.patch_d, cfg.patch_d), cfg.weight_dtype_at_rest),
-                    ("vocab", "d_model"),
-                    jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
-                )
-                for window in windows
-            ]
-            mini_cfg = dataclasses.replace(cfg, d_model=cfg.patch_d)
-            # 3 Little transformer layers on top!
-            mini_model = [Layer.abstract(mini_cfg) for _ in range(3)]
-        else:
-            embed_dim = cfg.d_model
-            causal_convs = None
-            mini_model = None
-
+        """Define model structure."""
         return Weights(
             layers=[Layer.abstract(cfg) for _ in range(cfg.num_layers)],
             embedding=TensorInfo(
-                jax.ShapeDtypeStruct((cfg.vocab_size, embed_dim), cfg.weight_dtype_at_rest),
+                jax.ShapeDtypeStruct((cfg.vocab_size, cfg.d_model), cfg.weight_dtype_at_rest),
                 ("vocab", "d_model"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
             vocab_proj=TensorInfo(
-                jax.ShapeDtypeStruct((embed_dim, cfg.vocab_size), cfg.weight_dtype_at_rest),
+                jax.ShapeDtypeStruct((cfg.d_model, cfg.vocab_size), cfg.weight_dtype_at_rest),
                 ("d_model", "vocab"),
                 jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
             gamma_final=TensorInfo(
-                jax.ShapeDtypeStruct((embed_dim,), cfg.weight_dtype_at_rest),
+                jax.ShapeDtypeStruct((cfg.d_model,), cfg.weight_dtype_at_rest),
                 ("d_model",),
                 jax.nn.initializers.constant(1.0),
-            ),
-            causal_convs=causal_convs,
-            mini_model=mini_model,
-            lad_hidden=TensorInfo(
-                jax.ShapeDtypeStruct((embed_dim, embed_dim), cfg.weight_dtype_at_rest),
-                ("d_model", "ffw"),
-                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
-            ),
-            lad_predictor=TensorInfo(
-                jax.ShapeDtypeStruct((embed_dim, 3), cfg.weight_dtype_at_rest),
-                ("d_model", "vocab"),
-                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
-            ),
-            lad_regressor=TensorInfo(
-                jax.ShapeDtypeStruct((embed_dim, 1), cfg.weight_dtype_at_rest),
-                ("d_model", "vocab"),
-                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
-            ),
-            sad_hidden=TensorInfo(
-                jax.ShapeDtypeStruct((embed_dim, embed_dim), cfg.weight_dtype_at_rest),
-                ("d_model", "ffw"),
-                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
-            ),
-            sad_predictor=TensorInfo(
-                jax.ShapeDtypeStruct((embed_dim, 3), cfg.weight_dtype_at_rest),
-                ("d_model", "vocab"),
-                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
-            ),
-            sad_regressor=TensorInfo(
-                jax.ShapeDtypeStruct((embed_dim, 1), cfg.weight_dtype_at_rest),
-                ("d_model", "vocab"),
-                jax.nn.initializers.he_normal(in_axis=0, out_axis=1),
             ),
         )
 
@@ -380,12 +252,10 @@ class Weights:
         )
 
     @classmethod
-    def init(
-        cls, cfg: Config, key: jax.random.PRNGKey, mesh: jax.sharding.Mesh, rules: dict, use_low_mem_init: bool = True
-    ):
+    def init(cls, cfg: Config, key: jax.random.PRNGKey, mesh: jax.sharding.Mesh, 
+             rules: dict, use_low_mem_init: bool = True):
         def _init():
             abstract = cls.abstract(cfg)
-            # Create one new RNG key per tensor.
             num_leaves = len(jax.tree_util.tree_leaves(abstract))
             key_iter = iter(jax.random.split(key, num_leaves))
             return jax.tree.map(
@@ -399,129 +269,24 @@ class Weights:
         return jax.device_put(_init(), cls.shardings(cfg, mesh, rules))
 
 
-@struct.dataclass
-class KVCache:
-    k: list[jax.Array]  # (batch_size, key_heads, max_seq_len, key_dim)
-    v: list[jax.Array]  # (batch_size, key_heads, max_seq_len, key_dim)
-    lengths: jax.Array  # [batch_size]
-
-    @classmethod
-    def abstract(cls, cfg: Config, batch_size: int, max_seq_len: int):
-        return KVCache(
-            k=[
-                TensorInfo(
-                    jax.ShapeDtypeStruct((batch_size, cfg.key_heads, max_seq_len, cfg.key_dim), jnp.bfloat16),
-                    ("batch", "key_heads", "sequence", "key_dim"),
-                )
-                for _ in range(cfg.num_layers)
-            ],
-            v=[
-                TensorInfo(
-                    jax.ShapeDtypeStruct((batch_size, cfg.key_heads, max_seq_len, cfg.key_dim), jnp.bfloat16),
-                    ("batch", "key_heads", "sequence", "key_dim"),
-                )
-                for _ in range(cfg.num_layers)
-            ],
-            lengths=TensorInfo(
-                jax.ShapeDtypeStruct((batch_size,), jnp.int32),
-                ("batch",),
-            ),
-        )
-
-    @classmethod
-    def shardings(cls, cfg: Config, mesh: jax.sharding.Mesh, rules: ShardingRules):
-        abstract = cls.abstract(
-            cfg, batch_size=1, max_seq_len=cfg.max_seq_len
-        )  # Batch size 1, since we just want the axes names.
-        return jax.tree.map(
-            lambda info: _logical_to_sharding(info.logical_axes, mesh, rules),
-            abstract,
-            is_leaf=lambda x: isinstance(x, TensorInfo),
-        )
-
-    @classmethod
-    def init(cls, cfg: Config, batch_size: int, max_seq_len: int):
-        abstract = cls.abstract(cfg, batch_size, max_seq_len)
-        return jax.tree.map(
-            lambda info: jnp.zeros(info.shape.shape, info.shape.dtype),
-            abstract,
-            is_leaf=lambda x: isinstance(x, TensorInfo),
-        )
-
-    @property
-    def time_axis(self) -> int:
-        return 2
-
-
 def segment_ids_to_positions(segment_ids):
-    """Converts segment IDs to position numbers within each segment.
-    
-    Example:
-    Tokens = [[A,T,C,G,A,T,C,G], # Sequence 1
-             [G,C,T,A,0,0,0,0]] # Sequence 2 (padded with zeros)
-    
-    segment_ids = [[1,1,1,1,1,1,1,1], # All 1s because it's one complete sequence
-                   [1,1,1,1,0,0,0,0]] # 1s for real sequence, 0s for padding
-    
-    # After segment_ids_to_positions
-    positions = [[0,1,2,3,4,5,6,7], # Counts up for the whole sequence
-                 [0,1,2,3,0,0,0,0]] # Counts up for real tokens, 0 for padding
-    ]
-    
-    This is important because position embeddings need to know where real tokens start and end.
-
-    Counts up from 0 within each same segment ID, restarts at 0 for new segment IDs, and keeps 0 for padding (segment_id=0)
-
-    """
-
+    """Convert segment IDs to position indices within each segment."""
     def scan_fun(a, b):
-        # a[0] is current position count
-        # a[1] is previous segment ID
-        # b is current segment id
+        # a[0] is position count, a[1] is previous segment ID
         return ((a[0] + 1) * (a[1] == b[1]) + b[0], b[1])
-
-    # Initialize with zeros and the segment IDs
+    
     vals = (jnp.zeros_like(segment_ids), segment_ids)
-
-    # Use JAX's associative scan to efficiently compute positions
-    # The [0 at the end takes just the position counts, not the segment IDs]
     return jnp.array(jax.lax.associative_scan(scan_fun, vals, axis=-1)[0], dtype="int32")
 
 
-def _generate_pos_embeddings(
-    positions: jax.Array, features: int, min_timescale=1.0, max_timescale=16384.0
-) -> tuple[jax.Array, jax.Array]:
-    """Generate Sin/Cos for Rotary Embeddings.
-
-    Generates sinusoids at (features//2) different timescales, where the
-    timescales form a geometric series from min_timescale to max_timescale
-    (max_timescale is not included, but would be the next element in the series).
-
-    Sinusoids are evaluated at integer positions i in [0, length).
-
-    The outputs are computed as:
-
-    sin[b, t, j] = sin(rope_pos[b, t] / timescale[j])
-    cos[b, t, j] = cos(rope_pos[b, t] / timescale[j])
-
-    Args:
-        postions: [batch, time]
-        features: d_head.
-        min_timescale: an optional float
-        max_timescale: an optional float
-
-    Returns:
-        output_sin: a float32 Tensor with shape [length, features // 2]
-        output_cos: a float32 Tensor with shape [length, features // 2]
-    """
-    # Forked from
-    # flaxformer/components/embedding.py;l=592
+def _generate_pos_embeddings(positions: jax.Array, features: int, 
+                            min_timescale=1.0, max_timescale=16384.0):
+    """Generate sin/cos for Rotary Position Embeddings (RoPE)."""
     fraction = jnp.arange(0, features, 2, dtype=jnp.float32) / features
     timescale = min_timescale * (max_timescale / min_timescale) ** fraction
     rotational_frequency = 1.0 / timescale
-    # Must use high precision einsum here, since rounding off to a bfloat16 is
-    # catastrophic. bfloat16 rounds 257 to 256, but sin(257) is very different
-    # from sin(256).
+    
+    # High precision for position encoding
     sinusoid_inp = jnp.einsum(
         "BT,k->BTk",
         positions,
@@ -532,22 +297,22 @@ def _generate_pos_embeddings(
 
 
 def apply_rotary_embedding(x, sin, cos):
+    """Apply rotary position embeddings to queries/keys."""
     assert x.ndim == 4
     assert sin.ndim == 3 and cos.ndim == 3
     x1, x2 = jnp.split(x, 2, axis=-1)
-    sin, cos = sin[:, None, :, :], cos[:, None, :, :]  # [B, T, head_dim] -> [B, h, T, head_dim]
+    sin, cos = sin[:, None, :, :], cos[:, None, :, :]
     return jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
 
 
-def make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, causal: bool):
-
-    # [B, t, T]
+def make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, causal):
+    """Create causal attention mask with segment boundaries."""
+    # Segment mask: attend only within same segment
     segment_mask = q_segment_ids[:, :, None] == k_segment_ids[:, None, :]
-    # [B, t, T] -> [B, 1, t, T]
-    segment_mask = segment_mask[:, None, :, :]
-
+    segment_mask = segment_mask[:, None, :, :]  # Add head dimension
+    
     if causal:
-        # [b, h, t, T]
+        # Causal mask: attend only to previous positions
         qk = (1, 1, q_len, k_len)
         q_iota = jax.lax.broadcasted_iota(jnp.int32, qk, 2)
         k_iota = jax.lax.broadcasted_iota(jnp.int32, qk, 3)
@@ -559,51 +324,21 @@ def make_attention_mask(q_len, k_len, q_segment_ids, k_segment_ids, q_offset, ca
         return segment_mask
 
 
-def attention(
-    q: jax.Array,
-    k: jax.Array,
-    v: jax.Array,
-    q_segment_ids: jax.Array,
-    k_segment_ids: jax.Array,
-    q_offset: jax.Array,
-    cfg: Config,
-    internals: Any,
-    layer_idx: int,
-) -> jax.Array:
-    """
-    Compute attention.
-
-    Args:
-    q: Query tensor of shape (batch_size, num_heads, q_len, head_dim)
-    k: Key tensor of shape (batch_size, num_heads, k_len, head_dim)
-    v: Value tensor of shape (batch_size, num_heads, k_len, head_dim)
-    q_segment_ids: Query segment IDs of shape (batch_size, q_len)
-    k_segment_ids: Key segment IDs of shape (batch_size, k_len)
-    q_offset: Query offset of shape (batch_size,)
-    cfg: Configuration object
-
-    Returns:
-    Attention output of shape (batch_size, num_heads, q_len, head_dim)
-    """
-    # Div sqrt(key_dim)
+def attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg, internals, layer_idx):
+    """Multi-head attention computation."""
     scale = q.shape[-1] ** -0.5
     assert q.dtype == jnp.float32
     assert k.dtype == jnp.float32
     qk = jnp.einsum("bhtd,bhTd->bhtT", q, k) * scale
     mask = make_attention_mask(q.shape[2], k.shape[2], q_segment_ids, k_segment_ids, q_offset, cfg.causal)
-    # Apply the combined mask
     qk = jnp.where(mask, qk, -1e30)
-    # Jax softmax impl includes max subtraction for numerical stability, no need to
-    # do it outside.
     attn = jax.nn.softmax(qk.astype(jnp.float32), axis=-1)
     internals['layers'][layer_idx]['attn_scores'] = attn
     return jnp.einsum("bhtT,bhTd->bhtd", attn, v).astype(jnp.bfloat16)
 
 
-def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
-    """Flash attention kernel!"""
-
-    # On TPUv3, pallas seems to only work with float32.
+def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg):
+    """Flash attention kernel for TPU."""
     q, k, v = jnp.float32(q), jnp.float32(k), jnp.float32(v)
     scale = q.shape[-1] ** -0.5
 
@@ -623,24 +358,15 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
     def _f(q, k, v, q_segment_ids, kv_segment_ids):
         segment_ids = flash_attention.SegmentIds(q_segment_ids, kv_segment_ids)
         return flash_attention.flash_attention(
-            q,
-            k,
-            v,
+            q, k, v,
             segment_ids=segment_ids,
             causal=True,
             sm_scale=scale,
             block_sizes=flash_attention.BlockSizes(
-                block_q=512,
-                block_k_major=512,
-                block_k=512,
-                block_b=1,
-                block_q_major_dkv=512,
-                block_k_major_dkv=512,
-                block_k_dkv=512,
-                block_q_dkv=512,
-                block_k_major_dq=512,
-                block_k_dq=512,
-                block_q_dq=512,
+                block_q=512, block_k_major=512, block_k=512, block_b=1,
+                block_q_major_dkv=512, block_k_major_dkv=512,
+                block_k_dkv=512, block_q_dkv=512,
+                block_k_major_dq=512, block_k_dq=512, block_q_dq=512,
             ),
         )
 
@@ -648,46 +374,41 @@ def attention_kernel(q, k, v, q_segment_ids, kv_segment_ids, cfg: Config):
 
 
 def rms_norm(x: jax.Array, gamma: jax.Array) -> jax.Array:
-    """Apply RMS normalization."""
+    """RMS normalization."""
     rms = jnp.sqrt(jnp.mean(jnp.astype(x, jnp.float32)**2, axis=-1, keepdims=True) + 1e-6)
     return jnp.astype(gamma * x / rms, jnp.bfloat16)
 
 
-def forward_layer(
-    x: jax.Array,
-    segment_ids: jax.Array,
-    layer: Layer,
-    sin: jax.Array,
-    cos: jax.Array,
-    idx: int,
-    cfg: Config,
-    cache: KVCache | None = None,
-    internals: Any = None,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    # First RMSNorm (Pre-LN for attention)
-    internals['layers'].append({})
-    # Cast non-norms to bfloat16 for faster operations.
-    layer = dataclasses.replace(layer,
-                                q=cfg.active_weight_dtype(layer.q),
-                                k=cfg.active_weight_dtype(layer.k),
-                                v=cfg.active_weight_dtype(layer.v),
-                                w1=cfg.active_weight_dtype(layer.w1),
-                                w2=cfg.active_weight_dtype(layer.w2),
+def forward_layer(x, segment_ids, layer, sin, cos, idx, cfg, cache=None, internals=None) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Forward pass through a single transformer layer."""
+    if internals is not None and 'layers' in internals:
+        internals['layers'].append({})
+    
+    # Cast weights to active dtype
+    layer = dataclasses.replace(
+        layer,
+        q=cfg.active_weight_dtype(layer.q),
+        k=cfg.active_weight_dtype(layer.k),
+        v=cfg.active_weight_dtype(layer.v),
+        w1=cfg.active_weight_dtype(layer.w1),
+        w2=cfg.active_weight_dtype(layer.w2),
     )
+    
+    # Pre-attention RMSNorm
     with jax.named_scope("attn_pre_norm"):
         attn_in = rms_norm(x, layer.attn_in_gamma)
-
+    
     # Multi-head attention
     with jax.named_scope("qkv_matmul"):
         q = jnp.einsum("btd,dhq->bhtq", attn_in, layer.q)
         k = jnp.einsum("btd,dhk->bhtk", attn_in, layer.k)
         v = jnp.einsum("btd,dhv->bhtv", attn_in, layer.v)
-
+    
     # Apply rotary embeddings
     with jax.named_scope("rope"):
         q = apply_rotary_embedding(q, sin, cos)
         k = apply_rotary_embedding(k, sin, cos)
-
+    
     with jax.named_scope("cache_update"):
         if cache is not None:
             cache_k, cache_v = cache.k[idx], cache.v[idx]
@@ -696,7 +417,6 @@ def forward_layer(
                 # Axis -1 because we are in vmap.
                 return jax.lax.dynamic_update_slice_in_dim(original, update, at, axis=cache.time_axis - 1)
 
-            
             k, v = jax.vmap(update, in_axes=(0, 0, 0))(cache_k, k.astype(cache_k.dtype), cache.lengths), jax.vmap(
                 update, in_axes=(0, 0, 0)
             )(cache_v, v.astype(cache_v.dtype), cache.lengths)
@@ -712,7 +432,7 @@ def forward_layer(
             q_segment_ids = segment_ids
             k_segment_ids = segment_ids
             q_offset = jnp.zeros(x.shape[0], dtype=jnp.int32)
-
+    
     # Compute attention
     with jax.named_scope("attention"):
         if cfg.use_attn_kernel:
@@ -721,296 +441,182 @@ def forward_layer(
             attn_out = attention_kernel(q, k, v, q_segment_ids, k_segment_ids, cfg)
         else:
             attn_out = attention(q, k, v, q_segment_ids, k_segment_ids, q_offset, cfg, internals, idx)
-
-    # Project attention output
+    
+    # Project and apply post-attention norm
     with jax.named_scope("projection"):
         attn_out = jnp.einsum("bhtq,hqd->btd", attn_out, layer.proj)
-
-    # Residual connection
-    with jax.named_scope("residual"):
+    
+    with jax.named_scope("attn_residual"):
         attn_out = rms_norm(attn_out, layer.attn_out_gamma)
         x = x + attn_out
-
-    # Second RMSNorm (Pre-LN for FFN)
+    
+    # Pre-FFN RMSNorm
     with jax.named_scope("ffn_pre_norm"):
         ff_in = rms_norm(x, layer.ff_in_gamma)
-
-    # FFN
+    
+    # Feedforward network
     with jax.named_scope("ffw"):
         ff_out = jnp.einsum("btd,df->btf", ff_in, layer.w1)
         ff_out = jax.nn.gelu(ff_out)
         ff_out = jnp.einsum("btf,fd->btd", ff_out, layer.w2)
-
-    # Residual connection
-    with jax.named_scope("residual"):
+    
+    # Apply post-FFN norm and residual
+    with jax.named_scope("ffn_residual"):
         ff_out = rms_norm(ff_out, layer.ff_out_gamma)
         x = x + ff_out
-
-
-    if cfg.return_sae_intermediates and idx == cfg.num_layers // 2:
+    
+    # Store intermediate activations for SAE if requested
+    if cfg.return_sae_intermediates and idx == 6:  # Layer 6 hardcoded as in original
         internals[f'layer_{idx}_activations'] = x
+    
     return x, k, v
 
 
-def causal_conv1d(x, weight):
-    """
-    Perform causal 1D convolution over the 'patch' dimension.
-
-    Args:
-    x: input of shape (batch_size, time, patch, in_channels)
-    weight: convolution kernel of shape (kernel_size, in_channels, out_channels)
-
-    Returns:
-    Output of shape (batch_size, time, patch, out_channels)
-    """
-    kernel_size, _, out_channels = weight.shape
-
-    # Pad the input to maintain the output size
-    padded_x = jnp.pad(x, ((0, 0), (kernel_size - 1, 0), (0, 0)))
-
-    # Perform convolution
-    out = jax.lax.conv_general_dilated(
-        lhs=padded_x, rhs=weight, window_strides=(1,), padding="VALID", dimension_numbers=("NHC", "HIO", "NHC")
-    )
-
-    return out
-
-
-def forward(
-    x: jax.Array,
-    segment_ids: jax.Array,
-    weights: Weights,
-    cfg: Config,
-    cache: KVCache | None = None,
-    *,
-    aux: Any | None = None,
-):
-
-    internals = {'layers': []}
-    # Embed input tokens [B, T] -> [B, T D]
+def forward(x, segment_ids, weights, cfg, cache=None, aux=None):
+    """Forward pass through the full model."""
+    internals = {'layers': []} if not cfg.use_attn_kernel else {}
+    
+    # Token embeddings
     embeds = weights.embedding[x, :]
     x = embeds
-    batch, time = x.shape[0], x.shape[1]
-    # To reduce attention cost, we can do something like MEGABYTE.
-    if cfg.mega_byte:
-        # Assume in this scenario embedding D is much smaller, lets call it patch_D.
-        assert x.shape[-1] == cfg.patch_d
-        # [B,T,patch_d] -> [B, T//patch_size, patch_size, patch_d]
-        x = x.reshape(batch, time // cfg.patch_size, cfg.patch_size, cfg.patch_d)
-        # Sub sampling segment ids will work because they are padded to multiples of patch
-        # size.
-        x = x.reshape(-1, cfg.patch_size, cfg.patch_d)
-        for filter in weights.causal_convs:
-            x = causal_conv1d(x, filter)
-        x = x.reshape(batch, time // cfg.patch_size, cfg.patch_size, cfg.patch_d)
-        x = x.reshape(batch, time // cfg.patch_size, cfg.d_model)
-        main_block_segment_ids = segment_ids[:, :: cfg.patch_size]
-        positions = segment_ids_to_positions(main_block_segment_ids)
-        assert x.shape[1] == main_block_segment_ids.shape[1]
-    else:
-        positions = segment_ids_to_positions(segment_ids)
-        main_block_segment_ids = segment_ids
-    # Apply rotary embeddings: [B, T, head_dim]
-    if cache is not None:
-        # For inference with cache, we need to index the positional embeddings
-        start_indices = cache.lengths
-    else:
-        start_indices = jnp.zeros((batch,), dtype=jnp.int32)
-    # NOTE: At inference time this only works for UNPACKED sequences.
-    positions = start_indices[:, None] + positions
-    # [B, T, head_dim]
-    sin, cos = _generate_pos_embeddings(positions, cfg.key_dim, min_timescale=1.0, max_timescale=cfg.max_seq_len)
-
+    batch = x.shape[0]
+    
+    # Position embeddings
+    positions = segment_ids_to_positions(segment_ids)
+    sin, cos = _generate_pos_embeddings(positions, cfg.key_dim, max_timescale=cfg.max_seq_len)
+    
+    # Forward through layers
     for idx, layer in enumerate(weights.layers):
-        x, k, v = forward_layer(x, main_block_segment_ids, layer, sin, cos, idx, cfg, cache, internals)
-        if cache is not None:
-            cache.k[idx] = k
-            cache.v[idx] = v
-
-    # At this point, if we are MEGABYTE:
-    # We have shape [B, T//patch_size, D]
-    if cfg.mega_byte:
-        # In effect, run a tiny transformer with a way bigger batch dim (i.e. we just want to do patch size tokens at once).
-        # We don't need a cache here since this will be patch specific, and at inference time we make one patch per step.
-        x = x.reshape(batch, time // cfg.patch_size, cfg.patch_size, cfg.patch_d)
-        prev_token_embeds = embeds[:, :-1, :]
-        prev_token_embeds = jnp.concatenate([jnp.zeros_like(embeds[:, 0:1, :]), prev_token_embeds], axis=1)
-        prev_token_embeds = prev_token_embeds.reshape(batch, time // cfg.patch_size, cfg.patch_size, cfg.patch_d)
-        x = x + prev_token_embeds
-        x = x.reshape(-1, cfg.patch_size, cfg.patch_d)
-        per_patch_segment_ids = segment_ids.reshape(batch, time // cfg.patch_size, cfg.patch_size)
-        per_patch_segment_ids = per_patch_segment_ids.reshape(-1, cfg.patch_size)
-        positions = segment_ids_to_positions(segment_ids)
-        per_patch_positions = positions.reshape(batch, time // cfg.patch_size, cfg.patch_size)
-        per_patch_positions = positions.reshape(-1, cfg.patch_size)
-        sin, cos = _generate_pos_embeddings(
-            per_patch_positions, cfg.key_dim, min_timescale=1.0, max_timescale=cfg.max_seq_len
-        )
-        mini_model_cfg = dataclasses.replace(cfg, use_attn_kernel=False)
-        for idx, layer in enumerate(weights.mini_model):
-            x, _, _ = forward_layer(x, per_patch_segment_ids, layer, sin, cos, idx, mini_model_cfg, None)
-        x = x.reshape(batch, time // cfg.patch_size, cfg.patch_size, cfg.patch_d)
-        x = x.reshape(batch, time, cfg.patch_d)
-
-    # Final layer norm.
+        x, k, v = forward_layer(x, segment_ids, layer, sin, cos, idx, cfg, cache, internals)
+    
+    # Final RMSNorm
     x = rms_norm(x, weights.gamma_final)
-    # Project to vocabulary size
+    
+    # Project to vocabulary
     logits = jnp.einsum("btd,dv->btv", x, weights.vocab_proj)
-
-    # If we have aux to predict (i.e. laminar associated domains, do so):
-    if aux is not None:
-        last_nonzero = jnp.sum(segment_ids > 0, axis=-1)
-        indices = last_nonzero[:, None, None] - 1
-        last_xs = jnp.take_along_axis(x, indices, 1)
-        internals['last_embed'] = last_xs
-        assert last_xs.shape[1] == 1
-        lad = jax.nn.gelu(jnp.einsum("btd,df->btf", last_xs, weights.lad_hidden))
-        internals["lad_pred"] = jnp.einsum("btf,fv", lad, weights.lad_predictor)[:, 0, :]  # [B, 3]
-        internals["lad_reg"] = jnp.einsum("btf,fv", lad, weights.lad_regressor)[:, 0, 0]  # [B]
-        sad = jax.nn.gelu(jnp.einsum("btd,df->btf", last_xs, weights.sad_hidden))
-        internals["sad_pred"] = jnp.einsum("btf,fv", sad, weights.sad_predictor)[:, 0, :]  # [B, 3]
-        internals["sad_reg"] = jnp.einsum("btf,fv", sad, weights.sad_regressor)[:, 0, 0]  # [B]
-
-    if cache is not None:
-        # Sum where there is a valid segment id (i.e. non padding tokens) [B, T] -> [B,]
-        cache = dataclasses.replace(cache, lengths=cache.lengths + jnp.sum(segment_ids != 0, axis=-1))
-        return logits, cache, internals, x
+    
     return logits, internals, x
 
 
-# Training.
+def compute_loss(weights, x, segment_ids, y, cfg, aux=None):
+    """Compute loss with optional repetitive element weighting."""
+    logits, internals, _ = forward(x, segment_ids, weights, cfg, aux=aux)
+    
+    # Base mask: exclude padding (segment_id = 0)
+    loss_mask = jnp.where(segment_ids == 0, 0, 1)
+    
+    # Apply repetitive element weighting if lowercase mask is provided
+    if aux is not None and "lowercase_mask" in aux:
+        lowercase_mask = aux["lowercase_mask"]
+        # Weight: 0.0 for lowercase (repetitive elements), 1.0 for uppercase
+        token_weights = jnp.where(lowercase_mask == 1, 0.0, 1.0)
+        loss_mask = loss_mask * token_weights
+    
+    # Compute cross-entropy loss
+    num_classes = logits.shape[-1]
+    labels_one_hot = jax.nn.one_hot(y, num_classes)
+    log_probs = jax.nn.log_softmax(logits, axis=-1)
+    per_token_loss = -jnp.sum(labels_one_hot * log_probs, axis=-1)
+    
+    # Apply weighted mask
+    weighted_loss = per_token_loss * loss_mask
+    
+    # Normalize by total weight
+    total_weight = jnp.sum(loss_mask)
+    loss = jnp.sum(weighted_loss) / jnp.maximum(total_weight, 1.0)
+    
+    # Calculate accuracy (unweighted for true performance)
+    predictions = jnp.argmax(logits, axis=-1)
+    valid_mask = jnp.where(segment_ids == 0, 0, 1)
+    correct = (predictions == y) * valid_mask
+    accuracy = jnp.sum(correct) / jnp.maximum(jnp.sum(valid_mask), 1.0)
+    
+    internals["token_prediction_loss"] = loss
+    internals["accuracy"] = accuracy
+    
+    # Track separate metrics for repetitive vs non-repetitive regions
+    if aux is not None and "lowercase_mask" in aux:
+        lowercase_mask = aux["lowercase_mask"]
+        # Lowercase (repetitive) accuracy
+        lowercase_correct = jnp.sum(correct * lowercase_mask)
+        lowercase_total = jnp.maximum(jnp.sum(valid_mask * lowercase_mask), 1.0)
+        internals["lowercase_accuracy"] = lowercase_correct / lowercase_total
+        
+        # Uppercase (non-repetitive) accuracy
+        uppercase_mask = (1 - lowercase_mask) * valid_mask
+        uppercase_correct = jnp.sum(correct * uppercase_mask)
+        uppercase_total = jnp.maximum(jnp.sum(uppercase_mask), 1.0)
+        internals["uppercase_accuracy"] = uppercase_correct / uppercase_total
+    
+    return loss, internals
 
 
-def get_lr_with_cosine_decay_and_warmup(step: int, total_steps: int, max_lr: float, min_lr: float, warmup_steps: int):
-    """Calculate learning rate using cosine decay with linear warmup."""
+# Training utilities
 
+def get_lr_with_cosine_decay_and_warmup(step, total_steps, max_lr, min_lr, warmup_steps):
+    """Cosine learning rate schedule with linear warmup."""
     def warmup(s):
         return max_lr * (s / warmup_steps)
-
+    
     def cosine_decay(s):
         progress = (s - warmup_steps) / (total_steps - warmup_steps)
         return min_lr + 0.5 * (max_lr - min_lr) * (1 + jnp.cos(jnp.pi * progress))
-
+    
     return jax.lax.cond(step < warmup_steps, warmup, cosine_decay, step)
 
 
-def adam_update(
-    param: jax.Array, grad: jax.Array, m: jax.Array, v: jax.Array, lr: float, t: int, beta1=0.9, beta2=0.999, eps=1e-8
-):
-    # Momentum.
+def adam_update(param, grad, m, v, lr, t, beta1=0.9, beta2=0.999, eps=1e-8):
+    """Adam optimizer update."""
     m = beta1 * m + (1 - beta1) * grad
-    # Grad variance.
     v = beta2 * v + (1 - beta2) * jnp.square(grad)
-    # Debiasing (helps with early training).
     m_hat = m / (1 - beta1 ** (t + 1))
     v_hat = v / (1 - beta2 ** (t + 1))
-    # Adjusts the gradient update w/ momentum by the variance. Effectively
-    # high variance = more cautious step, low variance = more aggressive step.
     update = lr * m_hat / (jnp.sqrt(v_hat) + eps)
     return param - update, m, v
 
 
-def init_optimizer_state(weights: Weights):
+def init_optimizer_state(weights):
+    """Initialize Adam optimizer state."""
     def _zeros_like(old):
         if isinstance(old, jax.ShapeDtypeStruct):
             return jax.ShapeDtypeStruct(old.shape, old.dtype, sharding=old.sharding)
         else:
             return jax.device_put(jnp.zeros_like(old), old.sharding)
-
+    
     return jax.tree_map(lambda p: (_zeros_like(p), _zeros_like(p)), weights)
 
 
-def cross_entropy_loss(
-    logits: jax.Array, labels: jax.Array, mask: jax.Array, internals: jax.Array | None = None
-) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, Any]:
-    num_classes = logits.shape[-1]
-    labels_one_hot = jax.nn.one_hot(labels, num_classes)
-    log_probs = jax.nn.log_softmax(logits, axis=-1)
-    loss = -jnp.sum(labels_one_hot * log_probs, axis=-1)
-    loss *= mask
-
-    if internals is not None:
-        internals["per_token_loss"] = loss
-
-    valid_tokens = jnp.sum(mask)
-    # Compute mean over valid values.
-    loss = loss.sum() / valid_tokens
-
-    predictions = jnp.argmax(logits, axis=-1)
-    correct_predictions = jnp.sum((predictions == labels) * mask)
-    accuracy = correct_predictions / valid_tokens
-
-    return (loss, accuracy) if internals is None else (loss, accuracy, internals)
-
-
-def compute_loss(
-    weights: Weights,
-    x: jax.Array,
-    segment_ids: jax.Array,
-    y: jax.Array,
-    cfg: Config,
-    aux: Any | None = None,
-) -> tuple[jax.Array, Any]:
-    logits, internals, _ = forward(x, segment_ids, weights, cfg, aux=aux)
-    # Important assumption that segment_ids 0 is 'padding'.
-    loss_mask = jnp.where(segment_ids == 0, 0, 1)
-    if not cfg.causal:
-        assert "bert_mask" in aux
-        # Only count the loss for tokens that were masked in BERT.
-        loss_mask &= aux["bert_mask"]
-
-    loss, accuracy, internals = cross_entropy_loss(logits, y, loss_mask, internals)
-    internals["token_prediction_loss"] = loss
-    internals["accuracy"] = accuracy
-    return loss, internals
-
-
-def update_weights(weights: Weights, grads: Weights, state: Any, lr: float, t: int, cfg: Config, internals: Any):
+def update_weights(weights, grads, state, lr, t, cfg, internals):
+    """Update model weights with gradient clipping."""
     def update_fn(param, grad, state, grad_norm):
         m, v = state
-        # Clip and rescale gradients when they exceed a specified value, useful for training instabilities.
-        # This clips per parameter - rather than globally, but that lets us overlap weights sync on the bwd pass.
-        # Bit hacky? TBD if needed.
+        # Gradient clipping
         scale_factor = jnp.maximum(grad_norm, cfg.grad_norm_clip)
         grad = grad / scale_factor.astype(grad.dtype) * cfg.grad_norm_clip
         param_update, m_new, v_new = adam_update(param, grad, m, v, lr, t)
         return param_update, (m_new, v_new)
-
+    
     grad_norms = jax.tree.map(jnp.linalg.norm, grads)
     internals["grad_norms"] = grad_norms
     updated = jax.tree_map(update_fn, weights, grads, state, grad_norms)
-    # Use weights for it's tree prefix.
     new_weights = jax.tree.map(lambda _, u: u[0], weights, updated)
     new_state = jax.tree.map(lambda _, u: u[1], weights, updated)
     return new_weights, new_state, internals
 
 
-def update_step(
-    weights: Weights,
-    x: jax.Array,
-    segment_ids: jax.Array,
-    y: jax.Array,
-    opt_state: Any,
-    step: int,
-    cfg: Config,
-    aux: Any | None,
-    override_compute_loss_fn = None
-):
-    if override_compute_loss_fn:
-        compute_loss_fn = override_compute_loss_fn
-    else:
-        compute_loss_fn = compute_loss
-
-    (loss, internals), grads = jax.value_and_grad(compute_loss_fn, has_aux=True)(weights, x, segment_ids, y, cfg, aux)
+def update_step(weights, x, segment_ids, y, opt_state, step, cfg, aux=None):
+    """Single training step."""
+    (loss, internals), grads = jax.value_and_grad(compute_loss, has_aux=True)(
+        weights, x, segment_ids, y, cfg, aux
+    )
     lr = get_lr_with_cosine_decay_and_warmup(step, cfg.total_steps, cfg.max_lr, cfg.min_lr, cfg.warmup_steps)
     weights, opt_state, internals = update_weights(weights, grads, opt_state, lr, step, cfg, internals)
     internals["lr"] = lr
     return loss, weights, opt_state, internals
 
 
-def input_shardings(
-    mesh, rules
-) -> tuple[jax.sharding.NamedSharding, jax.sharding.NamedSharding, jax.sharding.NamedSharding]:
+def input_shardings(mesh, rules):
+    """Define input sharding for distributed training."""
     logical_axes = {
         "x": P("batch", "sequence"),
         "segment_ids": P("batch", "sequence"),
@@ -1021,21 +627,24 @@ def input_shardings(
     return physical_axes
 
 
-# Checkpointing logic
-def make_mngr(path="/tmp/checkpoint_manager_sharded", erase: bool = False):
+# Checkpointing
+
+def make_mngr(path="/tmp/checkpoint_manager_sharded", erase=False):
+    """Create checkpoint manager."""
     if erase:
         path = ocp.test_utils.erase_and_create_empty(path)
     options = ocp.CheckpointManagerOptions(max_to_keep=3)
-    mngr = ocp.CheckpointManager(path, options=options)
-    return mngr
+    return ocp.CheckpointManager(path, options=options)
 
 
-def save(mngr: ocp.CheckpointManager, weights: Weights, opt_state: Any, step: int):
+def save(mngr, weights, opt_state, step):
+    """Save checkpoint."""
     mngr.save(step, args=ocp.args.StandardSave({"weights": weights, "opt_state": opt_state}))
     mngr.wait_until_finished()
 
 
-def load(mngr: ocp.CheckpointManager, cfg: Config, step: int | None = None):
+def load(mngr, cfg, step=None):
+    """Load checkpoint."""
     abstract_weights = Weights.abstract(cfg)
     weights_shapes_shardings = jax.tree.map(
         lambda info: jax.ShapeDtypeStruct(
@@ -1054,51 +663,47 @@ def load(mngr: ocp.CheckpointManager, cfg: Config, step: int | None = None):
     return restored["weights"], restored["opt_state"]
 
 
-# Inference.
-def prepare_chunk(chunk, pad_to: int, pad_id: int):
-    # [length] -> [1, padded]
-    chunk = jnp.pad(chunk, (0, pad_to - len(chunk)))[None, :]
-    segment_ids = jnp.where(chunk != pad_id, 1, 0).astype(jnp.int32)
-    return chunk, segment_ids
+# SAE checkpoint support
+
+def make_sae_mngr(path="/tmp/sae_checkpoint_manager", erase=False):
+    """Create checkpoint manager for SAE weights."""
+    if erase:
+        path = ocp.test_utils.erase_and_create_empty(path)
+    options = ocp.CheckpointManagerOptions(max_to_keep=3)
+    return ocp.CheckpointManager(path, options=options)
 
 
-def sample_next_token(logits, temperature=1.0, greedy: bool = True):
-
-    if greedy:
-        return jnp.argmax(logits, -1)
-    else:
-        # Apply temperature
-        logits = logits / temperature
-        # Convert to probabilities
-        probs = jax.nn.softmax(logits, axis=-1)
-        # Sample from the distribution
-        return jax.random.categorical(jax.random.PRNGKey(0), probs, axis=-1)
+def save_sae(mngr, sae_weights, sae_opt_state, step):
+    """Save SAE checkpoint."""
+    to_save = {"sae_weights": sae_weights, "sae_opt_state": sae_opt_state}
+    mngr.save(step, args=ocp.args.StandardSave(to_save))
+    mngr.wait_until_finished()
 
 
-def sample_from_prompt(
-    tokens: jax.Array,
-    weights: Weights,
-    cache: KVCache,
-    cfg: Config,
-    batch_idx: int = 0,
-    num_steps: int = 20,
-    greedy: bool = True,
-):
-    """Samples from a prompt."""
-
-    # Calculate the next power of 2 for padding, up to cfg.max_seq.
-    assert len(tokens) <= cfg.max_seq_len
-    pad_to = 2 ** math.ceil(math.log2((len(tokens))))
-    prompt, prompt_segment_ids = prepare_chunk(tokens, pad_to=pad_to, pad_id=0)
-    cache = dataclasses.replace(cache, lengths=jax.lax.dynamic_update_index_in_dim(cache.lengths, 0, batch_idx, axis=0))
-    logits, cache, _ = jax.jit(forward, static_argnames="cfg")(prompt, prompt_segment_ids, weights, cfg, cache)
-    next_token_logit = logits[batch_idx, cache.lengths[batch_idx] - 1, :]
-
-    tokens = []
-    for _ in range(0, num_steps):
-        next_token = sample_next_token(next_token_logit, greedy=greedy)[None]
-        tokens.append(next_token[0])
-        prompt, prompt_segment_ids = prepare_chunk(next_token, pad_to=1, pad_id=0)
-        logits, cache, _ = jax.jit(forward, static_argnames="cfg")(prompt, prompt_segment_ids, weights, cfg, cache)
-        next_token_logit = logits[batch_idx, 0, :]
-    return tokens, cache
+def load_sae(mngr, cfg, step=None):
+    """Load SAE checkpoint."""
+    weights_shapes = {
+        'expand': jax.ShapeDtypeStruct((cfg.d_model, 8192), jnp.float32),
+        'contract': jax.ShapeDtypeStruct((8192, cfg.d_model), jnp.float32)
+    }
+    
+    opt_shapes = {
+        'expand': (
+            jax.ShapeDtypeStruct((cfg.d_model, 8192), jnp.float32),
+            jax.ShapeDtypeStruct((cfg.d_model, 8192), jnp.float32)
+        ),
+        'contract': (
+            jax.ShapeDtypeStruct((8192, cfg.d_model), jnp.float32),
+            jax.ShapeDtypeStruct((8192, cfg.d_model), jnp.float32)
+        )
+    }
+    
+    restored = mngr.restore(
+        mngr.latest_step() if step is None else step,
+        args=ocp.args.StandardRestore({
+            "sae_weights": weights_shapes,
+            "sae_opt_state": opt_shapes
+        })
+    )
+    
+    return restored["sae_weights"], restored["sae_opt_state"]
