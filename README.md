@@ -1,7 +1,7 @@
 # Nucleotide GPT: A Decoder-Only Transformer for Genomic Sequences
 
 ## Overview
-Nucleotide GPT is a decoder-only transformer model specifically designed for genomic sequence modeling. This implementation adapts the minimal transformer architecture from <u>Minformer</u> by Sholto Douglas for genomic data processing and generation. 
+Nucleotide GPT is a decoder-only transformer model specifically designed for genomic sequence modeling. This implementation adapts the minimal transformer architecture from <u>Minformer</u> by Sholto Douglas (with contributions from Tristan Frizza) for genomic data processing and generation. 
 
 **Key Features:**
 - Efficient transformer architecture optimized for genomic sequences
