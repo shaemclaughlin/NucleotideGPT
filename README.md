@@ -124,7 +124,10 @@ python train.py --resume_from_checkpoint --checkpoint_dir gs://YOUR_BUCKET/check
 ```
 
 ### Finetuning
-After pretraining, finetune on genomic classification tasks from the Genomic Benchmarks dataset.
+After pretraining, finetune on genomic classification tasks. This project uses the Genomic Benchmarks dataset collection.
+
+Download from Genomic Benchmarks Github (https://github.com/ML-Bioinfo-CEITEC/genomic_benchmarks).
+
 Example usage:
 ```
 python finetune.py \
