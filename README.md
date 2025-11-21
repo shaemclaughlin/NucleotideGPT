@@ -20,7 +20,138 @@ Nucleotide GPT employs a LLaMA-style decoder-only transformer with the following
 - Flash Attention for efficient training
 - 500M parameters
 
-## Getting Started
+## Pretrained Model Checkpoints
+Pretrained model checkpoints for the 0.5 RE weighted model are available on Zenodo (DOI:10.5281/zenodo.17665954).
+
+**Checkpoint Details:**
+- Tokenization: Single-nucleotide tokenization
+- RE Weighting: 0.5 (50% downweighting of repetitive elements in the loss function)
+- Training Steps: Three checkpoints available (10000, 15000, 20000). Recommended to use the latest checkpoint 20000
+- File Size: 16.9B
+
+### Download Instructions
+```
+# Download from Zenodo
+wget https://zenodo.org/record/17665955/files/softmasked_3_checkpoints.tar.gz
+
+# Extract
+tar -xzf softmasked_3_checkpoints.tar.gz
+```
+
+## Loading Pretrained Models and Inference
+### Setup
+```
+import jax
+import jax.numpy as jnp
+import numpy as np
+from modelling import model
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from modelling import model
+
+# Define tokenization function
+def tokenize_sequence(sequence):
+    """
+    Tokenize DNA sequence to single-nucleotide tokens.
+    
+    Args:
+        sequence: DNA sequence string (ACGTN, case-insensitive)
+        
+    Returns:
+        List of token IDs
+    """
+    VOCAB = ['P', 'A', 'C', 'G', 'T', 'N']
+    stoi = {ch: i for i, ch in enumerate(VOCAB)}
+    # Treat lowercase same as uppercase
+    stoi.update({
+        'a': stoi['A'], 'c': stoi['C'],
+        'g': stoi['G'], 't': stoi['T'],
+        'n': stoi['N']
+    })
+    return [stoi.get(ch.upper(), 0) for ch in sequence]
+
+# Create model configuration
+cfg = model.Config(
+    d_model=2048,
+    ffw_multiplier=4,
+    query_heads=8,
+    key_heads=8,
+    num_layers=12,
+    key_dim=128,
+    vocab_size=6,
+    max_seq_len=8192,  # Can adjust based on your needs
+    causal=True,
+    use_attn_kernel=False,
+    weight_dtype_at_rest=jnp.float32,
+    active_weight_dtype=jnp.bfloat16,
+    rules=model.mdl_parallel_rules,
+    mesh=model.create_mesh(),
+    max_lr=3e-4,
+    min_lr=1e-5,
+    warmup_steps=50,
+    total_steps=100000,
+)
+```
+
+### Load Checkpoint
+```
+# Path to downloaded checkpoint
+checkpoint_path = "./softmasked_3_20000"
+
+# Create checkpoint manager
+ckpt_manager = model.make_mngr(path=checkpoint_path)
+
+# Load weights
+weights, opt_state = model.load(ckpt_manager, cfg)
+print("Checkpoint loaded successfully!")
+```
+
+### Extract Embeddings
+Get contextualized embeddings for any DNA sequence:
+
+```
+def get_embeddings(sequence, weights, cfg, max_length=8192):
+  """
+  Extract embeddings for a DNA sequence.
+
+  Args:
+    sequence: DNA sequence string
+    weights: Loaded model weights
+    cfg: Model configuration
+    max_length: Maximum sequence length to process
+
+  Returns:
+    numpy array of shape (seq_len, d_model) containing embeddings
+  """
+  # Tokenize and prepare inputs
+  tokens = tokenize_sequences(sequence[:max_length])
+  segment_ids = [1] * len(tokens)
+
+  # Pad to max_length - len(tokens)
+  if padding_length > 0:
+    tokens.extend([0] * padding_length)
+    segment_ids.extend([0] * padding_length)
+
+  # Convert to JAX arrays and add batch dim
+  x = jnp.array([tokens], dtype=jnp.int32)
+
+  # Forward pass
+  _, internals, embeddings = model.forward(x, segment_ids, weights, cfg)
+
+  # Return embeddings (remove batch dim, exclude padding)
+  actual_length = len(tokenize_sequence(sequence[:max_length]))
+  return np.array(embeddings[0, :actual_length, :])
+
+# Example usage
+dna_sequence = "ATCGATCGATCGTAGCTAGCTA"
+embeddings = get_embeddings(dna_sequence, weights, cfg)
+print(f"Embeddings shape: {embeddings.shape}")
+```
+
+
+## Pretraining the Model from Scratch
 ### Prerequisites
 - Python 3.8+
 - Google Cloud account with TPU access
