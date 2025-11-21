@@ -126,16 +126,18 @@ def get_embeddings(sequence, weights, cfg, max_length=8192):
     numpy array of shape (seq_len, d_model) containing embeddings
   """
   # Tokenize and prepare inputs
-  tokens = tokenize_sequences(sequence[:max_length])
+  tokens = tokenize_sequence(sequence[:max_length])
   segment_ids = [1] * len(tokens)
 
   # Pad to max_length - len(tokens)
+  padding_length = max_length - len(tokens)
   if padding_length > 0:
     tokens.extend([0] * padding_length)
     segment_ids.extend([0] * padding_length)
 
   # Convert to JAX arrays and add batch dim
   x = jnp.array([tokens], dtype=jnp.int32)
+  segment_ids = jnp.array([segment_ids], dtype=jnp.int32)
 
   # Forward pass
   _, internals, embeddings = model.forward(x, segment_ids, weights, cfg)
